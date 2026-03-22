@@ -1,7 +1,3 @@
-// Follow this setup guide to integrate the Deno language server with your editor:
-// https://deno.land/manual/getting_started/setup_your_environment
-// This enables autocomplete, go to definition, etc.
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
@@ -11,13 +7,12 @@ const corsHeaders = {
 }
 
 serve(async (req) => {
-  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
   }
 
   try {
-    // 1. Validate the JWT and parse the request payload
+    // 1. Authenticate the user making the request
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
       Deno.env.get('SUPABASE_ANON_KEY') ?? '',
@@ -30,7 +25,7 @@ serve(async (req) => {
     const { note_id } = await req.json()
     if (!note_id) throw new Error('Note ID is required')
 
-    // 2. Fetch the Note record to get the text / file path
+    // 2. Fetch the note content
     const { data: note, error: noteError } = await supabaseClient
       .from('notes')
       .select('*')
@@ -39,118 +34,110 @@ serve(async (req) => {
 
     if (noteError || !note) throw new Error('Note not found')
 
-    let rawText = note.raw_text
+    const rawText = note.raw_text
+    if (!rawText) throw new Error('This note has no text content to summarize. Please ensure the note has raw text.')
 
-    // If text isn't extracted yet but we have a file, ideally call a PDF extraction service.
-    if (!rawText && note.file_url) {
-        console.log(`Extracting text from ${note.file_url}...`)
-        rawText = "Extracted text snippet representing the content of the file. In a full production app, this is replaced by a text-extraction library parsing the PDF."
+    // 3. Call Google Gemini API (FREE tier — gemini-1.5-flash)
+    const geminiApiKey = Deno.env.get('GEMINI_API_KEY')
+    if (!geminiApiKey) throw new Error('GEMINI_API_KEY is not configured in Supabase secrets.')
+
+    const prompt = `You are an expert medical AI tutor. Analyze the following medical notes and respond with ONLY a valid JSON object (no markdown, no code blocks).
+
+The JSON must have exactly these three keys:
+- "summary": array of exactly 5 strings — the highest-yield clinical takeaways
+- "key_concepts": object where keys are medical terms and values are their definitions
+- "flashcards": array of objects, each with "question" (string), "answer" (string), "difficulty_level" ("easy" | "medium" | "hard")
+
+Medical notes to analyze:
+"""
+${rawText.substring(0, 12000)}
+"""`
+
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 4096,
+          }
+        })
+      }
+    )
+
+    if (!geminiRes.ok) {
+      const errBody = await geminiRes.text()
+      throw new Error(`Gemini API error: ${geminiRes.status} — ${errBody}`)
     }
 
-    if (!rawText) throw new Error('No text content available to summarize')
-
-    // 3. Call the LLM (OpenAI)
-    const openAiApiKey = Deno.env.get('OPENAI_API_KEY')
+    const geminiData = await geminiRes.json()
+    const rawContent: string = geminiData.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
     
-    let aiResponseSummary: string[] = [];
-    let aiResponseKeyConcepts: Record<string, string> = {};
-    let aiResponseFlashcards: any[] = [];
+    // Strip markdown code fences if Gemini wraps the output (safety measure)
+    const cleanContent = rawContent.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim()
 
-    if (openAiApiKey) {
-        console.log("Calling OpenAI API for text summarization...");
-        const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${openAiApiKey}`
-            },
-            body: JSON.stringify({
-                model: 'gpt-4o-mini',
-                response_format: { type: "json_object" },
-                messages: [
-                    {
-                        role: 'system',
-                        content: `You are a medical AI assistant. Analyze the text and return a JSON object with exactly three keys:
-1. 'summary': An array of EXACTLY 5 strings, representing the highest-yield medical takeaways.
-2. 'key_concepts': A dictionary object of medical terminology defined from the text.
-3. 'flashcards': An array of objects, each with 'question', 'answer', and 'difficulty_level' (easy/medium/hard).`
-                    },
-                    { role: 'user', content: rawText }
-                ],
-                temperature: 0.2
-            })
-        });
-
-        if (!aiRes.ok) {
-            const errBody = await aiRes.text();
-            throw new Error(`OpenAI API error: ${aiRes.status} - ${errBody}`);
-        }
-
-        const aiData = await aiRes.json();
-        const parsed = JSON.parse(aiData.choices[0].message.content);
-        
-        aiResponseSummary = parsed.summary || [];
-        aiResponseKeyConcepts = parsed.key_concepts || {};
-        aiResponseFlashcards = parsed.flashcards || [];
-    } else {
-        console.warn("Missing OPENAI_API_KEY. Simulating response.");
-        aiResponseSummary = [
-           "Arrhythmias are abnormal heart rhythms caused by structural or electrical issues.",
-           "Atrial Fibrillation (AFib) is the most common sustained arrhythmia, heightening stroke risk.",
-           "Treatment often involves anticoagulants and rate-control medications like Beta-blockers.",
-           "Ventricular Fibrillation is a medical emergency requiring immediate CPR and defibrillation.",
-           "ECG is the gold standard diagnostic tool for identifying the specific type of arrhythmia."
-        ];
-        aiResponseKeyConcepts = {
-            "AFib": "Irregular, often rapid heart rate that causes poor blood flow.",
-            "ECG": "Electrocardiogram, a test measuring the electrical activity of the heart."
-        };
-        aiResponseFlashcards = [
-            { question: "What is the most common sustained arrhythmia?", answer: "Atrial Fibrillation (AFib)", difficulty_level: 'easy' },
-            { question: "What is the gold standard diagnostic tool for arrhythmias?", answer: "Electrocardiogram (ECG)", difficulty_level: 'easy' }
-        ];
+    let parsed: any
+    try {
+      parsed = JSON.parse(cleanContent)
+    } catch {
+      throw new Error(`Gemini returned invalid JSON. Raw: ${cleanContent.substring(0, 200)}`)
     }
 
-    // 4. Save the Generated Output to the database marked as UNVERIFIED
-    const { data: summaryData, error: insertError } = await supabaseClient
+    const aiSummary: string[] = Array.isArray(parsed.summary) ? parsed.summary : []
+    const keyConcepts: Record<string, string> = typeof parsed.key_concepts === 'object' ? parsed.key_concepts : {}
+    const flashcards: any[] = Array.isArray(parsed.flashcards) ? parsed.flashcards : []
+
+    // 4. Save the summary (marked as UNVERIFIED — admin must verify before public badge)
+    const supabaseAdmin = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    )
+
+    const { data: summaryData, error: insertError } = await supabaseAdmin
       .from('summaries')
       .insert({
-         note_id: note.id,
-         ai_summary: aiResponseSummary,
-         key_concepts: aiResponseKeyConcepts,
-         verified: false, // CRITICAL: Must be false by default
+        note_id: note.id,
+        ai_summary: aiSummary,
+        key_concepts: keyConcepts,
+        verified: false,
       })
       .select()
       .single()
 
     if (insertError) throw insertError
 
-    // 5. Generate flashcards linked to this summary
-    const flashcardsToInsert = aiResponseFlashcards.map((fc: any) => ({
+    // 5. Save generated flashcards linked to this summary
+    if (flashcards.length > 0) {
+      const flashcardsToInsert = flashcards.map((fc: any) => ({
         user_id: user.id,
         question: fc.question,
         answer: fc.answer,
         source_summary_id: summaryData.id,
-        difficulty_level: fc.difficulty_level || 'medium'
-    }));
-
-    if (flashcardsToInsert.length > 0) {
-        await supabaseClient.from('flashcards').insert(flashcardsToInsert);
+        difficulty_level: ['easy', 'medium', 'hard'].includes(fc.difficulty_level) ? fc.difficulty_level : 'medium',
+      }))
+      await supabaseAdmin.from('flashcards').insert(flashcardsToInsert)
     }
 
     return new Response(
-      JSON.stringify({ 
-          success: true, 
-          message: 'AI Processing Complete. Outputs saved as Unverified.',
-          summary_id: summaryData.id 
+      JSON.stringify({
+        success: true,
+        message: `Summary complete! Generated ${aiSummary.length} key points and ${flashcards.length} flashcards.`,
+        summary_id: summaryData.id,
+        summary: aiSummary,
+        key_concepts: keyConcepts,
+        flashcards_generated: flashcards.length,
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
     )
+
   } catch (error: any) {
-    console.error("Function error:", error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status: 400,
-    })
+    console.error('generate-summary error:', error)
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400 }
+    )
   }
 })
