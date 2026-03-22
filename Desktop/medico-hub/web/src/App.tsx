@@ -12,6 +12,7 @@ import PublicFeed from './pages/PublicFeed';
 import NoteViewer from './pages/NoteViewer';
 import AdminPortal from './pages/AdminPortal';
 import { useAuthStore } from './store/authStore';
+import LoadingScreen from './components/LoadingScreen';
 
 function Home() {
   return (
@@ -151,12 +152,16 @@ function Navbar() {
 }
 
 function App() {
-  const initialize = useAuthStore(state => state.initialize);
+  const { initialize, isLoading } = useAuthStore();
   
   // Initialize Supabase Auth Session on mount
   useEffect(() => {
      initialize();
   }, [initialize]);
+
+  if (isLoading) {
+    return <LoadingScreen />;
+  }
 
   return (
     <Router>
